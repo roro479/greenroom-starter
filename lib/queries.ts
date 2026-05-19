@@ -13,6 +13,7 @@ import {
   comps,
   expenses,
   settlements,
+  dealExtractions,
   venues,
   type Recoup,
 } from "@/db/schema";
@@ -52,6 +53,7 @@ export async function getShowById(id: string) {
       deal: deals,
       settlement: settlements,
       venue: venues,
+      extraction: dealExtractions,
     })
     .from(shows)
     .leftJoin(artists, eq(shows.artistId, artists.id))
@@ -60,6 +62,7 @@ export async function getShowById(id: string) {
     .leftJoin(deals, eq(deals.showId, shows.id))
     .leftJoin(settlements, eq(settlements.showId, shows.id))
     .leftJoin(venues, eq(shows.venueId, venues.id))
+    .leftJoin(dealExtractions, eq(dealExtractions.showId, shows.id))
     .where(eq(shows.id, id));
 
   if (rows.length === 0) return null;
@@ -96,6 +99,16 @@ export async function getShowById(id: string) {
     comps: showComps,
     recoups,
   };
+}
+
+/** Fetch a deal extraction by deal ID (for share page / direct access). */
+export async function getExtractionByDealId(dealId: string) {
+  const rows = await db
+    .select()
+    .from(dealExtractions)
+    .where(eq(dealExtractions.dealId, dealId))
+    .limit(1);
+  return rows[0] ?? null;
 }
 
 export type ShowWithRelations = NonNullable<

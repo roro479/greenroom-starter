@@ -12,6 +12,83 @@ This is the starter codebase for the Greenroom Applied AI PM case study.
 
 You're looking at a working but mediocre product. It's enough to feel real, but every workflow has gaps. **Your job isn't to fix everything — it's to pick a slice and design it well.** See your case study brief for full instructions.
 
+## What's new — AI Settlement Worksheet
+
+This fork implements the **AI Settlement Worksheet** for `vs`, `percentage_of_net`, and `door` deals — replacing the "deal type not supported" empty state.
+
+### Setup: add the Anthropic API key
+
+The AI extraction step calls Claude. Add your key before running the app:
+
+```bash
+# Create .env.local in the greenroom-starter/ root
+echo 'ANTHROPIC_API_KEY=sk-ant-...' > .env.local
+```
+
+If you don't have an Anthropic API key, the extraction step will return an error with a "Try again" button, and Mariana can fall back to manual entry. All other features (math engine, worksheet, share link, PDF) work without the API key once terms are confirmed.
+
+### How to test AI extraction on an existing deal
+
+1. Open `/shows` and find a **vs deal** show (look for the "vs deal" badge).
+2. Click **Settle**.
+3. You'll see the deal notes displayed with a **Parse Deal** button.
+4. Click it — Claude reads the deal notes and returns structured terms.
+5. Review the confirmation form: source quotes, confidence scores, any contradictions with the structured DB fields.
+6. For any recoup with ambiguous `isInsideExpenseCap`, the confirm button is blocked until you choose.
+7. Confirm → worksheet renders.
+
+### How to run a full vs-deal settlement end-to-end
+
+```bash
+# 1. Make sure the DB is up to date
+npx drizzle-kit push
+
+# 2. Start the dev server
+npm run dev
+
+# 3. Open http://localhost:3000/shows
+# Find a vs deal → Settle → Parse Deal → Confirm → View worksheet
+```
+
+The worksheet renders:
+- **Gross box office** → platform fees → **net**
+- Each expense line (absorbed vs. passed-through flagged)
+- Ratchet tier evaluation (if applicable)
+- Guarantee vs. percentage comparison
+- Walkout pot (if applicable)
+- **Total to artist**
+
+After the worksheet:
+- **Share with TM** opens a mobile-responsive read-only link — no login required
+- **Export PDF** downloads a formatted settlement statement
+- **GM Approve** logs Marcus's approval with a timestamp
+
+### Running unit tests
+
+```bash
+npx vitest run lib/dealMath.test.ts
+```
+
+9 tests covering: guarantee wins, percentage wins, ratchet triggers, ratchet doesn't trigger, walkout pot, recoup inside cap, recoup outside cap, percentage-of-net, door deal.
+
+### New files in this fork
+
+| File | Purpose |
+|------|---------|
+| `lib/extraction.ts` | Anthropic API call + typed extraction types |
+| `lib/dealMath.test.ts` | Unit tests for math engine |
+| `app/shows/[id]/settle/actions.ts` | Server actions: extract, confirm, GM approve |
+| `app/shows/[id]/settle/ExtractionFlow.tsx` | 3-stage client component |
+| `app/shows/[id]/settle/GmApproveButton.tsx` | GM approval button |
+| `app/shows/[id]/settle/share/page.tsx` | Read-only shareable link |
+| `app/shows/[id]/settle/pdf/route.ts` | PDF export (Node.js runtime) |
+| `IMPLEMENTATION_PLAN.md` | Technical summary |
+| `INTERVIEW_PREP.md` | Interview prep: pitches, defenses, DB finding |
+| `LOOM_SCRIPT.md` | 7-minute walkthrough script |
+| `TRADEOFFS.md` | What was built, cut, and why |
+
+---
+
 ## Before you start
 
 You'll need:

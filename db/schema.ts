@@ -279,6 +279,41 @@ export const settlements = sqliteTable("settlements", {
 
   signoffText: text("signoff_text"),
   notes: text("notes"),
+
+  // AI settlement worksheet additions
+  worksheetJson: text("worksheet_json"),
+  gmApprovedAt: integer("gm_approved_at", { mode: "timestamp" }),
+  gmApprovedByUserId: text("gm_approved_by_user_id").references(() => users.id),
+});
+
+// -------- AI Deal Extractions --------
+
+/**
+ * Stores the result of running an AI extraction on a deal's dealNotesFreetext,
+ * and the confirmation log after Mariana reviews and approves the extracted terms.
+ *
+ * One row per deal. A deal can only be extracted once (UNIQUE on deal_id).
+ *
+ * extractionJson: raw JSON returned from the Anthropic API
+ * confirmedTermsJson: the terms after Mariana edited/confirmed them
+ * confirmationLogJson: audit log — which fields were edited vs accepted as-is,
+ *   with timestamp and userId
+ */
+export const dealExtractions = sqliteTable("deal_extractions", {
+  id: text("id").primaryKey(),
+  dealId: text("deal_id")
+    .notNull()
+    .unique()
+    .references(() => deals.id),
+  showId: text("show_id")
+    .notNull()
+    .references(() => shows.id),
+  extractionJson: text("extraction_json").notNull(),
+  confirmedTermsJson: text("confirmed_terms_json"),
+  confirmationLogJson: text("confirmation_log_json"),
+  confirmedAt: integer("confirmed_at", { mode: "timestamp" }),
+  confirmedByUserId: text("confirmed_by_user_id").references(() => users.id),
+  createdAt: integer("created_at", { mode: "timestamp" }).notNull(),
 });
 
 // -------- Type exports for convenience --------
@@ -294,6 +329,7 @@ export type TicketSale = typeof ticketSales.$inferSelect;
 export type Comp = typeof comps.$inferSelect;
 export type Expense = typeof expenses.$inferSelect;
 export type Settlement = typeof settlements.$inferSelect;
+export type DealExtraction = typeof dealExtractions.$inferSelect;
 
 // -------- Decoded JSON helpers --------
 

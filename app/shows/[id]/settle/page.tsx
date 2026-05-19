@@ -11,6 +11,9 @@ import {
   XCircle,
   Wallet,
   TrendingUp,
+  Share2,
+  FileDown,
+  CheckCircle2,
 } from "lucide-react";
 import { getShowById } from "@/lib/queries";
 import {
@@ -29,6 +32,9 @@ import {
 } from "@/lib/format";
 import type { Settlement, Recoup } from "@/db/schema";
 import { Logomark } from "@/components/brand/logo";
+import ExtractionFlow from "./ExtractionFlow";
+import GmApproveButton from "./GmApproveButton";
+import type { WorksheetStep } from "@/lib/dealMath";
 
 const RECOUP_LABELS: Record<Recoup["category"], string> = {
   marketing: "Marketing",
@@ -48,7 +54,7 @@ export default async function SettlePage({
   const data = await getShowById(id);
   if (!data) notFound();
 
-  const { show, artist, deal, ticketSales, expenses, settlement, recoups } =
+  const { show, artist, deal, ticketSales, expenses, settlement, recoups, extraction } =
     data;
 
   if (!deal) {
@@ -77,6 +83,15 @@ export default async function SettlePage({
   const disputedRecoups = recoups.filter((r) => r.status === "disputed");
   const isDisputed = settlement?.status === "disputed" || settlement?.status === "revised" || !!settlement?.disputedAt;
   const disputedRecoupValue = disputedRecoups.reduce((s, r) => s + r.amount, 0);
+
+  // AI worksheet: check if terms are confirmed and worksheet is computed
+  const AI_SUPPORTED_TYPES = ["vs", "percentage_of_net", "door"] as const;
+  type AiDealType = (typeof AI_SUPPORTED_TYPES)[number];
+  const isAiDealType = (t: string): t is AiDealType =>
+    AI_SUPPORTED_TYPES.includes(t as AiDealType);
+  const worksheetJson = settlement?.worksheetJson ?? null;
+  const confirmedTermsJson = extraction?.confirmedTermsJson ?? null;
+  const hasWorksheet = !!worksheetJson && !!confirmedTermsJson;
 
   return (
     <div className={`px-12 py-10 max-w-7xl ${isDisputed ? "bg-gradient-to-b from-rose-50/30 via-canvas to-canvas" : ""}`}>
@@ -127,7 +142,33 @@ export default async function SettlePage({
       )}
 
       <div className="space-y-6 mt-6">
-        {!calc.supported ? (
+        {!calc.supported && isAiDealType(deal.dealType) ? (
+          hasWorksheet ? (
+            // Stage 3: confirmed + worksheet computed
+            <AiWorksheet
+              showId={show.id}
+              worksheetJson={worksheetJson!}
+              settlement={settlement}
+              gmApprovedAt={settlement?.gmApprovedAt ?? null}
+            />
+          ) : (
+            // Stage 1 / 2: extract & confirm
+            <ExtractionFlow
+              showId={show.id}
+              dealId={deal.id}
+              extractionId={extraction?.id ?? null}
+              extractionJson={extraction?.extractionJson ?? null}
+              confirmedTermsJson={extraction?.confirmedTermsJson ?? null}
+              dealNotesFreetext={deal.dealNotesFreetext}
+              existingGuarantee={deal.guaranteeAmount}
+              existingPercentage={deal.percentage}
+              existingExpenseCap={deal.expenseCap}
+              existingHospitalityCap={deal.hospitalityCap}
+              existingBonusesJson={deal.bonusesJson}
+              dealType={deal.dealType}
+            />
+          )
+        ) : !calc.supported ? (
           <UnsupportedDeal
             dealType={calc.dealType}
             deal={deal}
@@ -171,6 +212,140 @@ export default async function SettlePage({
             </p>
           </div>
         </div>
+      </div>
+    </div>
+  );
+}
+
+// -------- AI Worksheet (Stage 3) --------
+
+function AiWorksheet({
+  showId,
+  worksheetJson,
+  settlement,
+  gmApprovedAt,
+}: {
+  showId: string;
+  worksheetJson: string;
+  settlement: Settlement | null;
+  gmApprovedAt: Date | null;
+}) {
+  let steps: WorksheetStep[] = [];
+  try {
+    steps = JSON.parse(worksheetJson) as WorksheetStep[];
+  } catch {
+    return (
+      <Card>
+        <CardContent className="py-8 text-center text-[13px] text-ink-500">
+          Worksheet data could not be loaded. Please re-confirm the deal terms.
+        </CardContent>
+      </Card>
+    );
+  }
+
+  const totalStep = steps[steps.length - 1];
+  const total = totalStep?.value ?? 0;
+
+  return (
+    <>
+      {/* Hero number */}
+      <div className="text-center py-10 mb-2">
+        <div className="eyebrow text-[10px] text-ink-400 mb-3">Total to artist</div>
+        <div
+          className="text-[72px] font-mono tabular font-bold text-ink-900 leading-none"
+          style={{ letterSpacing: "-0.03em" }}
+        >
+          {formatMoney(total)}
+        </div>
+        <div className="mt-4 flex items-center justify-center gap-3 flex-wrap">
+          {settlement?.status === "paid" ? (
+            <PlainBadge variant="brand">Paid</PlainBadge>
+          ) : settlement?.status === "signed" || settlement?.status === "finalized" ? (
+            <PlainBadge variant="brand">Signed</PlainBadge>
+          ) : settlement?.status === "disputed" ? (
+            <PlainBadge variant="rose">Disputed</PlainBadge>
+          ) : null}
+          {gmApprovedAt && (
+            <span className="inline-flex items-center gap-1 text-[11px] text-brand-700 bg-brand-50 px-2 py-0.5 rounded-md ring-1 ring-brand-200/60">
+              <CheckCircle2 className="h-3 w-3" />
+              GM approved {gmApprovedAt.toLocaleDateString("en-US", { month: "short", day: "numeric" })}
+            </span>
+          )}
+        </div>
+      </div>
+
+      {/* Worksheet breakdown */}
+      <Card accent="brand">
+        <CardHeader>
+          <div>
+            <CardTitle>Settlement worksheet</CardTitle>
+            <CardDescription>
+              AI-assisted — every number traces back to confirmed deal terms and live show data.
+            </CardDescription>
+          </div>
+        </CardHeader>
+        <CardContent className="divide-y divide-ink-100/80">
+          {steps.slice(0, -1).map((step, i) => (
+            <WorksheetRow key={i} step={step} />
+          ))}
+          <div className="pt-3" />
+          <div className="flex items-baseline justify-between py-3 font-semibold">
+            <span className="text-[13px] text-ink-900">Total to artist</span>
+            <span className="text-[18px] font-mono tabular text-ink-900">
+              {formatMoney(total)}
+            </span>
+          </div>
+        </CardContent>
+      </Card>
+
+      {/* Action bar */}
+      <div className="flex items-center justify-between flex-wrap gap-3 py-2">
+        <div className="flex items-center gap-2 flex-wrap">
+          <Link
+            href={`/shows/${showId}/settle/share`}
+            target="_blank"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-ink-700 text-[12.5px] font-medium ring-1 ring-ink-200/80 hover:bg-canvas-soft transition-colors"
+          >
+            <Share2 className="h-3.5 w-3.5" />
+            Share with TM
+          </Link>
+          <Link
+            href={`/shows/${showId}/settle/pdf`}
+            target="_blank"
+            className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-white text-ink-700 text-[12.5px] font-medium ring-1 ring-ink-200/80 hover:bg-canvas-soft transition-colors"
+          >
+            <FileDown className="h-3.5 w-3.5" />
+            Export PDF
+          </Link>
+        </div>
+        <GmApproveButton showId={showId} alreadyApproved={!!gmApprovedAt} />
+      </div>
+    </>
+  );
+}
+
+function WorksheetRow({ step }: { step: WorksheetStep }) {
+  const isNegative = step.value < 0;
+  const isTotal = step.label === "Total to artist";
+  return (
+    <div className="flex items-start justify-between py-2.5 gap-4">
+      <div className="min-w-0">
+        <div className={`text-[13px] ${isTotal ? "font-semibold text-ink-900" : "text-ink-600"}`}>
+          {step.label}
+        </div>
+        {step.formula && (
+          <div className="text-[11px] text-ink-400 mt-0.5 leading-snug">{step.formula}</div>
+        )}
+        {step.sourceRef && (
+          <div className="text-[10.5px] text-ink-300 mt-0.5 italic">{step.sourceRef}</div>
+        )}
+      </div>
+      <div
+        className={`text-[13.5px] font-mono tabular shrink-0 ${
+          isNegative ? "text-rose-700" : isTotal ? "font-semibold text-ink-900 text-[16px]" : "text-ink-900"
+        }`}
+      >
+        {isNegative ? `(${formatMoney(Math.abs(step.value))})` : formatMoney(step.value)}
       </div>
     </div>
   );

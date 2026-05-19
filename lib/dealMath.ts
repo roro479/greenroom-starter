@@ -29,6 +29,12 @@
  */
 
 import type { Deal, Expense, TicketSale, Bonus } from "@/db/schema";
+import type {
+  ConfirmedTerms,
+  ConfirmedRecoup,
+  RatchetTier,
+  WalkoutPot,
+} from "@/lib/extraction";
 
 export type SettlementCalculation =
   | {
@@ -183,6 +189,421 @@ export function calculateSettlement(input: CalcInput): SettlementCalculation {
     reason:
       `${friendlyName[deal.dealType]} deals aren't supported in the in-app tool yet. ` +
       `Power users at venues like The Crescent default to spreadsheets for these.`,
+  };
+}
+
+// ============================================================
+// NEW: AI-assisted deal type calculations (vs, % of net, door)
+// ============================================================
+
+/**
+ * Extended step type for AI-assisted worksheet — each step carries a formula
+ * string and a sourceRef so every number is traceable back to a deal term.
+ */
+export type WorksheetStep = {
+  label: string;
+  value: number;
+  formula: string;
+  sourceRef: string;
+};
+
+export type WorksheetCalculation =
+  | {
+      supported: true;
+      grossBoxOffice: number;
+      platformFees: number;
+      netBoxOffice: number;
+      cappedExpenses: number;
+      totalToArtist: number;
+      guaranteeSide: number | null;
+      percentageSide: number | null;
+      activePercentage: number | null;
+      winSide: "guarantee" | "percentage" | null;
+      steps: WorksheetStep[];
+    }
+  | { supported: false; reason: string };
+
+interface AiCalcInput {
+  confirmedTerms: ConfirmedTerms;
+  ticketSales: TicketSale[];
+  expenses: Expense[];
+  venueCapacity: number;
+}
+
+function sumGross(sales: TicketSale[]) {
+  return sales.reduce((s, t) => s + t.gross, 0);
+}
+function sumFees(sales: TicketSale[]) {
+  return sales.reduce((s, t) => s + t.fees, 0);
+}
+function sumPassThru(exps: Expense[]) {
+  return exps.filter((e) => !e.absorbedByVenue).reduce((s, e) => s + e.amount, 0);
+}
+function ticketsSold(sales: TicketSale[]) {
+  return sales.reduce((s, t) => s + (t.qty ?? 0), 0);
+}
+
+/**
+ * Find the active percentage for a ratchet deal.
+ * Ratchets are evaluated against tickets sold / venue capacity.
+ */
+function resolveRatchetPct(
+  tiers: RatchetTier[],
+  sold: number,
+  capacity: number,
+): { pct: number; tierLabel: string } {
+  const fillRate = capacity > 0 ? sold / capacity : 0;
+  const sorted = [...tiers].sort((a, b) => b.fromTicketPct - a.fromTicketPct);
+  for (const tier of sorted) {
+    if (fillRate >= tier.fromTicketPct) {
+      const pctLabel = `${(tier.percentage * 100).toFixed(0)}%`;
+      const fillLabel = `${(fillRate * 100).toFixed(0)}% sold ≥ ${(tier.fromTicketPct * 100).toFixed(0)}% threshold`;
+      return { pct: tier.percentage, tierLabel: `${pctLabel} (${fillLabel})` };
+    }
+  }
+  const base = sorted[sorted.length - 1];
+  return {
+    pct: base?.percentage ?? 0,
+    tierLabel: `${((base?.percentage ?? 0) * 100).toFixed(0)}% (base tier)`,
+  };
+}
+
+/**
+ * Calculate a vs deal (guarantee vs % of net/gross, whichever greater).
+ * Supports ratchet tiers, walkout pots, and recoups inside/outside the cap.
+ */
+export function calculateVsDeal(input: AiCalcInput): WorksheetCalculation {
+  const { confirmedTerms: t, ticketSales, expenses, venueCapacity } = input;
+
+  if (t.guarantee === null || t.percentage === null) {
+    return {
+      supported: false,
+      reason: "Vs deal requires both a guarantee amount and a percentage.",
+    };
+  }
+
+  const steps: WorksheetStep[] = [];
+
+  const gross = sumGross(ticketSales);
+  const fees = sumFees(ticketSales);
+  const passThru = sumPassThru(expenses);
+  const sold = ticketsSold(ticketSales);
+
+  steps.push({
+    label: "Gross box office",
+    value: gross,
+    formula: "Sum of ticket sales",
+    sourceRef: "POS / ticket platform",
+  });
+  steps.push({
+    label: "Ticket platform fees",
+    value: -fees,
+    formula: "Sum of platform fees (10% of gross)",
+    sourceRef: "Ticket platform",
+  });
+
+  // Recoups outside cap come off gross before net is computed
+  const recoupsOutside = (t.recoups ?? []).filter((r) => !r.isInsideExpenseCap);
+  const recoupsInside = (t.recoups ?? []).filter((r) => r.isInsideExpenseCap);
+
+  let preNetDeductions = 0;
+  for (const r of recoupsOutside) {
+    preNetDeductions += r.amount;
+    steps.push({
+      label: `Recoup (outside cap): ${r.label}`,
+      value: -r.amount,
+      formula: `Deducted from gross before net — outside expense cap`,
+      sourceRef: "Deal notes (recoup)",
+    });
+  }
+
+  const net = gross - fees - preNetDeductions;
+  steps.push({
+    label: "Net box office",
+    value: net,
+    formula:
+      recoupsOutside.length > 0
+        ? `Gross − platform fees − outside-cap recoups`
+        : `Gross − platform fees`,
+    sourceRef: "Calculated",
+  });
+
+  // Expenses: pass-through, capped. Recoups inside cap count toward cap usage.
+  const insideCapRecoupTotal = recoupsInside.reduce((s, r) => s + r.amount, 0);
+  const effectiveCap = t.expenseCap ?? Infinity;
+  const cappedExpenses = Math.min(passThru + insideCapRecoupTotal, effectiveCap);
+
+  // Show individual expense line and inside-cap recoups
+  steps.push({
+    label: "Pass-through expenses",
+    value: -passThru,
+    formula: "Sum of non-absorbed expense line items",
+    sourceRef: "Expense records",
+  });
+  for (const r of recoupsInside) {
+    steps.push({
+      label: `Recoup (inside cap): ${r.label}`,
+      value: -r.amount,
+      formula: "Counted within expense cap",
+      sourceRef: "Deal notes (recoup)",
+    });
+  }
+  if (t.expenseCap !== null) {
+    const overage = Math.max(0, passThru + insideCapRecoupTotal - t.expenseCap);
+    steps.push({
+      label: `Expense cap applied ($${t.expenseCap.toLocaleString()})`,
+      value: overage > 0 ? overage : 0,
+      formula: `Cap = $${t.expenseCap.toLocaleString()}; excess $${overage.toLocaleString()} absorbed by venue`,
+      sourceRef: "Deal notes (expense cap)",
+    });
+  }
+
+  const netAfterExpenses = Math.max(0, net - cappedExpenses);
+  steps.push({
+    label: "Net after expenses",
+    value: netAfterExpenses,
+    formula: t.percentageBasis === "gross"
+      ? "Gross (% of gross deal — expenses don't apply to percentage)"
+      : `Net − capped expenses`,
+    sourceRef: "Calculated",
+  });
+
+  // Determine active percentage (ratchet or flat)
+  let activePct = t.percentage;
+  let pctSource = `Deal notes (${(t.percentage * 100).toFixed(0)}% of ${t.percentageBasis ?? "net"})`;
+  if (t.ratchetTiers && t.ratchetTiers.length > 0) {
+    const { pct, tierLabel } = resolveRatchetPct(t.ratchetTiers, sold, venueCapacity);
+    activePct = pct;
+    pctSource = `Ratchet tier: ${tierLabel}`;
+    steps.push({
+      label: "Ratchet tier evaluation",
+      value: sold,
+      formula: `${sold} tickets sold / ${venueCapacity} capacity = ${((sold / venueCapacity) * 100).toFixed(1)}% fill rate`,
+      sourceRef: "Ticket sales",
+    });
+  }
+
+  // Percentage payout basis
+  const pctBasis = t.percentageBasis === "gross" ? gross : netAfterExpenses;
+  const percentagePayout = pctBasis * activePct;
+  steps.push({
+    label: `Artist percentage (${(activePct * 100).toFixed(0)}% of ${t.percentageBasis ?? "net"})`,
+    value: percentagePayout,
+    formula: `${(activePct * 100).toFixed(0)}% × ${t.percentageBasis === "gross" ? "gross" : "net after expenses"} ($${pctBasis.toLocaleString("en-US", { maximumFractionDigits: 2 })})`,
+    sourceRef: pctSource,
+  });
+
+  // Vs comparison
+  const guarantee = t.guarantee;
+  const winSide: "guarantee" | "percentage" = percentagePayout >= guarantee ? "percentage" : "guarantee";
+  const vsBase = Math.max(guarantee, percentagePayout);
+  steps.push({
+    label: `Guarantee vs percentage`,
+    value: vsBase,
+    formula: `max($${guarantee.toLocaleString()} guarantee, $${percentagePayout.toFixed(2)} percentage) → ${winSide} wins`,
+    sourceRef: "Deal notes (vs deal)",
+  });
+
+  // Walkout pot (all gross above threshold goes 100% to artist)
+  let walkoutBonus = 0;
+  if (t.walkout) {
+    const { threshold, basis, artistPct } = t.walkout;
+    const basisAmount = basis === "gross" ? gross : net;
+    if (basisAmount > threshold) {
+      walkoutBonus = (basisAmount - threshold) * artistPct;
+      steps.push({
+        label: `Walkout pot (${(artistPct * 100).toFixed(0)}% above $${threshold.toLocaleString()})`,
+        value: walkoutBonus,
+        formula: `(${basis === "gross" ? "gross" : "net"} $${basisAmount.toLocaleString()} − threshold $${threshold.toLocaleString()}) × ${(artistPct * 100).toFixed(0)}%`,
+        sourceRef: "Deal notes (walkout pot)",
+      });
+    } else {
+      steps.push({
+        label: `Walkout pot (not triggered)`,
+        value: 0,
+        formula: `${basis === "gross" ? "gross" : "net"} $${basisAmount.toLocaleString()} ≤ threshold $${threshold.toLocaleString()}`,
+        sourceRef: "Deal notes (walkout pot)",
+      });
+    }
+  }
+
+  const totalToArtist = vsBase + walkoutBonus;
+
+  steps.push({
+    label: "Total to artist",
+    value: totalToArtist,
+    formula:
+      walkoutBonus > 0
+        ? `Vs base $${vsBase.toFixed(2)} + walkout $${walkoutBonus.toFixed(2)}`
+        : `Vs base = $${vsBase.toFixed(2)}`,
+    sourceRef: "Calculated",
+  });
+
+  return {
+    supported: true,
+    grossBoxOffice: gross,
+    platformFees: fees,
+    netBoxOffice: net,
+    cappedExpenses,
+    totalToArtist,
+    guaranteeSide: guarantee,
+    percentageSide: percentagePayout,
+    activePercentage: activePct,
+    winSide,
+    steps,
+  };
+}
+
+/**
+ * Calculate a percentage-of-net deal (no guarantee floor).
+ */
+export function calculatePercentageOfNet(input: AiCalcInput): WorksheetCalculation {
+  const { confirmedTerms: t, ticketSales, expenses } = input;
+
+  if (t.percentage === null) {
+    return { supported: false, reason: "Percentage of net deal requires a percentage." };
+  }
+
+  const steps: WorksheetStep[] = [];
+
+  const gross = sumGross(ticketSales);
+  const fees = sumFees(ticketSales);
+  const passThru = sumPassThru(expenses);
+
+  steps.push({
+    label: "Gross box office",
+    value: gross,
+    formula: "Sum of ticket sales",
+    sourceRef: "POS / ticket platform",
+  });
+  steps.push({
+    label: "Ticket platform fees",
+    value: -fees,
+    formula: "Sum of platform fees",
+    sourceRef: "Ticket platform",
+  });
+
+  const net = gross - fees;
+  steps.push({
+    label: "Net box office",
+    value: net,
+    formula: "Gross − platform fees",
+    sourceRef: "Calculated",
+  });
+
+  const effectiveCap = t.expenseCap ?? Infinity;
+  const cappedExpenses = Math.min(passThru, effectiveCap);
+  steps.push({
+    label: `Expenses (capped at $${t.expenseCap?.toLocaleString() ?? "∞"})`,
+    value: -cappedExpenses,
+    formula: t.expenseCap
+      ? `min($${passThru.toFixed(2)} pass-through, $${t.expenseCap.toLocaleString()} cap)`
+      : `$${passThru.toFixed(2)} (no cap)`,
+    sourceRef: "Expense records + deal notes",
+  });
+
+  const netAfterExpenses = Math.max(0, net - cappedExpenses);
+  steps.push({
+    label: "Net after expenses",
+    value: netAfterExpenses,
+    formula: "Net − capped expenses",
+    sourceRef: "Calculated",
+  });
+
+  const payout = netAfterExpenses * t.percentage;
+  steps.push({
+    label: `Artist percentage (${(t.percentage * 100).toFixed(0)}% of net)`,
+    value: payout,
+    formula: `${(t.percentage * 100).toFixed(0)}% × $${netAfterExpenses.toFixed(2)}`,
+    sourceRef: "Deal notes",
+  });
+
+  steps.push({
+    label: "Total to artist",
+    value: payout,
+    formula: "Percentage of net (no guarantee floor)",
+    sourceRef: "Calculated",
+  });
+
+  return {
+    supported: true,
+    grossBoxOffice: gross,
+    platformFees: fees,
+    netBoxOffice: net,
+    cappedExpenses,
+    totalToArtist: payout,
+    guaranteeSide: null,
+    percentageSide: payout,
+    activePercentage: t.percentage,
+    winSide: null,
+    steps,
+  };
+}
+
+/**
+ * Calculate a door deal (artist gets ticket revenue minus capped expenses).
+ */
+export function calculateDoorDeal(input: AiCalcInput): WorksheetCalculation {
+  const { confirmedTerms: t, ticketSales, expenses } = input;
+
+  const steps: WorksheetStep[] = [];
+
+  const gross = sumGross(ticketSales);
+  const fees = sumFees(ticketSales);
+  const passThru = sumPassThru(expenses);
+
+  steps.push({
+    label: "Gross box office",
+    value: gross,
+    formula: "Sum of ticket sales (door revenue)",
+    sourceRef: "POS / ticket platform",
+  });
+  steps.push({
+    label: "Ticket platform fees",
+    value: -fees,
+    formula: "Sum of platform fees",
+    sourceRef: "Ticket platform",
+  });
+
+  const net = gross - fees;
+  steps.push({
+    label: "Net box office",
+    value: net,
+    formula: "Gross − fees",
+    sourceRef: "Calculated",
+  });
+
+  const effectiveCap = t.expenseCap ?? Infinity;
+  const cappedExpenses = Math.min(passThru, effectiveCap);
+  steps.push({
+    label: `Expenses (capped at $${t.expenseCap?.toLocaleString() ?? "∞"})`,
+    value: -cappedExpenses,
+    formula: t.expenseCap
+      ? `min($${passThru.toFixed(2)}, $${t.expenseCap.toLocaleString()} cap)`
+      : `$${passThru.toFixed(2)} (no cap)`,
+    sourceRef: "Expense records + deal notes",
+  });
+
+  const payout = Math.max(0, net - cappedExpenses);
+  steps.push({
+    label: "Total to artist",
+    value: payout,
+    formula: "Net − expenses (door deal: artist takes net revenue)",
+    sourceRef: "Deal notes",
+  });
+
+  return {
+    supported: true,
+    grossBoxOffice: gross,
+    platformFees: fees,
+    netBoxOffice: net,
+    cappedExpenses,
+    totalToArtist: payout,
+    guaranteeSide: null,
+    percentageSide: null,
+    activePercentage: null,
+    winSide: null,
+    steps,
   };
 }
 
