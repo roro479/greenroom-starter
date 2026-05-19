@@ -9,7 +9,7 @@
     "lint": "eslint",
     "db:push": "drizzle-kit push",
     "db:seed": "tsx db/seed.ts",
-    "db:reset": "rm -f data/greenroom.db && drizzle-kit push && tsx db/seed.ts",
+    "db:reset": "node -e \"try{require('fs').unlinkSync('data/greenroom.db')}catch(e){}\" && drizzle-kit push && tsx db/seed.ts",
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
