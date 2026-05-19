@@ -42,6 +42,7 @@ export interface ExtractionResult {
   recoups: ExtractedRecoup[] | null;
   confidence: Record<string, number>;
   sourceQuotes: Record<string, string>;
+  demoMode?: boolean;
 }
 
 export type ExtractionResponse =
@@ -103,22 +104,65 @@ Industry shorthand glossary:
 - "hosp $X" or "hospitality cap $X" or "hosp cap $X" = hospitalityCap is $X
 - "recoup" = a specific cost deducted from the settlement, may or may not be inside the expense cap`;
 
+// -------- Demo mode mock --------
+
+/**
+ * Returned when ANTHROPIC_API_KEY is missing or set to "demo".
+ * Reflects real deal structures from greenroom.db — the Coastal Spell
+ * scenario with a ratchet tier and an ambiguous marketing recoup.
+ */
+const MOCK_EXTRACTION: ExtractionResult = {
+  guarantee: 5000,
+  percentage: 0.80,
+  percentageBasis: "net",
+  expenseCap: 2500,
+  hospitalityCap: 500,
+  walkout: null,
+  ratchetTiers: [
+    { fromTicketPct: 0, toTicketPct: 0.80, percentage: 0.80 },
+    { fromTicketPct: 0.80, toTicketPct: null, percentage: 0.90 },
+  ],
+  recoups: [
+    {
+      label: "Marketing recoup",
+      amount: 900,
+      isInsideExpenseCap: null, // ambiguous — forces Mariana to choose
+    },
+  ],
+  confidence: {
+    guarantee: 0.97,
+    percentage: 0.95,
+    percentageBasis: 0.93,
+    expenseCap: 0.91,
+    hospitalityCap: 0.88,
+    ratchetTiers: 0.85,
+    recoups: 0.62,
+  },
+  sourceQuotes: {
+    guarantee: "$5,000 guarantee",
+    percentage: "80% of net",
+    percentageBasis: "net after expenses",
+    expenseCap: "Expenses capped $2,500",
+    hospitalityCap: "Hospitality cap $500",
+    ratchetTiers: "ratchets to 90% over 80% capacity",
+    recoups: "Marketing recoup of $900 against gross",
+  },
+  demoMode: true,
+};
+
 // -------- Core extraction function --------
 
 export async function extractDealTerms(
   dealNotesFreetext: string,
 ): Promise<ExtractionResponse> {
   const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    return {
-      ok: false,
-      error:
-        "ANTHROPIC_API_KEY is not configured. Add it to your .env.local file.",
-      fallbackToManual: true,
-    };
+  const DEMO_MODE = !apiKey || apiKey === "demo";
+
+  if (DEMO_MODE) {
+    return { ok: true, result: MOCK_EXTRACTION, fallbackToManual: false };
   }
 
-  const client = new Anthropic({ apiKey });
+  const client = new Anthropic({ apiKey: apiKey! });
 
   let rawText: string;
   try {
